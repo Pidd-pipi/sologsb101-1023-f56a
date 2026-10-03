@@ -41,6 +41,7 @@ import EmptyPanel from '../components/common/EmptyPanel';
 import { useTurnTimeline } from '../hooks/useTurnTimeline';
 import { filterGardens, useGardenStore } from '../stores/gardenStore';
 import { useBatchStore } from '../stores/batchStore';
+import { useSplitMergeStore } from '../stores/splitMergeStore';
 import { ALTITUDE_BANDS, CULTIVAR_OPTIONS, SOIL_OPTIONS, type Garden, type GardenDraft } from '../types/garden';
 import { BATCH_STATES, TENDERNESS_OPTIONS, type Batch, type BatchDraft } from '../types/batch';
 import {
@@ -82,6 +83,7 @@ export default function GardenList() {
   const advanceBatchState = useBatchStore((state) => state.advanceBatchState);
   const loadBatches = useBatchStore((state) => state.loadBatches);
   const loadReviews = useBatchStore((state) => state.loadReviews);
+  const loadSplitMerge = useSplitMergeStore((state) => state.loadAll);
 
   const [gardenModalOpen, setGardenModalOpen] = useState(false);
   const [editingGarden, setEditingGarden] = useState<Garden | null>(null);
@@ -268,8 +270,11 @@ export default function GardenList() {
     try {
       const snapshot = parseSnapshotJson(await readJsonFile(file));
       await importSnapshot(snapshot);
-      await Promise.all([loadGardens(), loadBatches(), loadReviews()]);
-      message.success(`导入成功：${snapshot.gardens.length} 个山场 / ${snapshot.batches.length} 个批次`);
+      await Promise.all([loadGardens(), loadBatches(), loadReviews(), loadSplitMerge()]);
+      message.success(
+        `导入成功：${snapshot.gardens.length} 个山场 / ${snapshot.batches.length} 个批次` +
+          (snapshot.splits?.length ? ` / ${snapshot.splits.length} 条拆批` : ''),
+      );
     } catch (error) {
       message.error(error instanceof Error ? error.message : '导入失败');
     }

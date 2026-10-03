@@ -7,6 +7,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import {
   App,
+  Alert,
   Button,
   Card,
   Col,
@@ -35,8 +36,10 @@ import FilterBar, { type FilterSelectConfig } from '../components/common/FilterB
 import GradeTag from '../components/common/GradeTag';
 import StatBadge from '../components/common/StatBadge';
 import EmptyPanel from '../components/common/EmptyPanel';
+import BaselinePanel from '../components/common/BaselinePanel';
 import { useGardenStore } from '../stores/gardenStore';
 import { useBatchStore } from '../stores/batchStore';
+import { useSplitMergeStore } from '../stores/splitMergeStore';
 import {
   buildReminders,
   filterRoasts,
@@ -57,6 +60,7 @@ import {
   isFullFire,
   roundTo,
 } from '../utils/tea';
+import { lineageOf } from '../utils/splitMerge';
 
 export default function RoastPlan() {
   const { message, modal } = App.useApp();
@@ -76,12 +80,16 @@ export default function RoastPlan() {
   const advanceRoastState = useRoastStore((state) => state.advanceRoastState);
   const movePass = useRoastStore((state) => state.movePass);
 
+  const baselines = useSplitMergeStore((state) => state.baselines);
+  const loadSplitMerge = useSplitMergeStore((state) => state.loadAll);
+
   const [modalOpen, setModalOpen] = useState(false);
   const [editingRoast, setEditingRoast] = useState<Roast | null>(null);
 
   useEffect(() => {
     void loadRoasts();
-  }, [loadRoasts]);
+    void loadSplitMerge();
+  }, [loadRoasts, loadSplitMerge]);
 
   const gardenMap = useMemo(() => new Map(gardens.map((garden) => [garden.id, garden])), [gardens]);
   const batchMap = useMemo(() => new Map(batches.map((batch) => [batch.id, batch])), [batches]);
@@ -314,6 +322,12 @@ export default function RoastPlan() {
             const fireLevel = fireLevelOfBatch(roasts, group.batchId);
             const load = fireLoadOfBatch(roasts, group.batchId);
             const fullFire = isFullFire(branch);
+            const groupBatch = batchMap.get(group.batchId);
+            const groupLineage = groupBatch ? lineageOf(groupBatch) : undefined;
+            const inheritedBaseline =
+              groupLineage?.kind === 'branch'
+                ? baselines.find((item) => item.id === groupLineage.baselineId) ?? null
+                : null;
             return (
               <Col key={group.batchId} xs={24} xl={12}>
                 <Card
@@ -341,6 +355,22 @@ export default function RoastPlan() {
                   <Typography.Text type="secondary" style={{ fontSize: 12 }}>
                     {FIRE_LEVEL_ADVICE[fireLevel]}
                   </Typography.Text>
+
+                  {inheritedBaseline ? (
+                    <Alert
+                      style={{ marginTop: 10 }}
+                      type="info"
+                      showIcon
+                      message="拆分前焙火道次为只读底稿，下方登记本支复焙安排"
+                      description={
+                        <BaselinePanel
+                          baseline={inheritedBaseline}
+                          section="roasts"
+                          sourceLabel={groupBatch ? labelOfBatch(groupBatch.id) : undefined}
+                        />
+                      }
+                    />
+                  ) : null}
 
                   <div style={{ marginTop: 10 }}>
                     {group.list.map((roast, index) => (

@@ -10,12 +10,13 @@ import {
   createId,
   listBatches,
   listGardens,
+  listMerges,
   listReviews,
   nowIso,
   putGarden,
   removeGarden as removeGardenRow,
 } from '../utils/db';
-import { averageScore, roundTo } from '../utils/tea';
+import { averageScore, isBatchBlendEligible, roundTo } from '../utils/tea';
 import { emptyFilterValue, matchKeyword, pickedIncludes, pickedSelect, type FilterValue } from '../components/common/FilterBar';
 
 /** 山场页筛选条件默认值：关键字 + 品种 / 土壤 / 海拔分段三个下拉多选 */
@@ -60,9 +61,9 @@ interface GardenStoreState {
   deleteGarden: (gardenId: string) => Promise<void>;
 }
 
-/** 依据山场 / 批次 / 审评计算指标 */
+/** 依据山场 / 批次 / 审评计算指标（已合回分支不重复计数，未确认合回批次不计入） */
 async function buildMetrics(gardens: Garden[]): Promise<{ metrics: Record<string, GardenMetrics> }> {
-  const [batches, reviews] = await Promise.all([listBatches(), listReviews()]);
+  const [batches, reviews, merges] = await Promise.all([listBatches(), listReviews(), listMerges()]);
   const scoreByBatch = new Map(reviews.map((review) => [review.batchId, review.totalScore]));
   const metrics: Record<string, GardenMetrics> = {};
   const scoresByGarden: Record<string, number[]> = {};
@@ -78,6 +79,9 @@ async function buildMetrics(gardens: Garden[]): Promise<{ metrics: Record<string
   });
 
   batches.forEach((batch) => {
+    // 已合回分支重量已计入合回批次，避免重复；未确认 / 失效合回批次先不参与台账汇总
+    if (batch.mergedInto) return;
+    if (batch.lineage?.kind === 'merged' && !isBatchBlendEligible(batch, merges)) return;
     const metric = metrics[batch.gardenId];
     if (!metric) return;
     metric.batchCount += 1;

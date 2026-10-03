@@ -239,3 +239,16 @@ body {
 .mono {
   font-family: 'SFMono-Regular', Menlo, Consolas, monospace;
 }
+
+/* 拆分前工艺只读底稿 */
+.baseline-panel {
+  background: rgba(47, 81, 54, 0.04);
+  border: 1px dashed var(--tea-line, #b7c7ad);
+  border-radius: 8px;
+  padding: 10px 12px;
+  width: 100%;
+}
+
+.baseline-panel .ant-tag {
+  margin-inline-end: 0;
+}

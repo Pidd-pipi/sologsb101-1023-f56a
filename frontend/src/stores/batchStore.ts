@@ -242,9 +242,13 @@ export const useBatchStore = create<BatchStoreState>((set, get) => ({
       gardenId: draft.gardenId,
       pickedAt: draft.pickedAt,
       freshLeafKg: draft.freshLeafKg,
+      maochaKg: draft.freshLeafKg,
       tenderness: draft.tenderness,
       weather: draft.weather.trim(),
       state: draft.state,
+      lineage: { kind: 'single' },
+      revision: 1,
+      mergedInto: null,
       createdAt: stamp,
       updatedAt: stamp,
     };
@@ -265,6 +269,7 @@ export const useBatchStore = create<BatchStoreState>((set, get) => ({
       tenderness: draft.tenderness,
       weather: draft.weather.trim(),
       state: draft.state,
+      revision: (existing.revision ?? 1) + 1,
       updatedAt: nowIso(),
     };
     await putBatch(next);

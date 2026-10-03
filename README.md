@@ -41,6 +41,7 @@ docker compose up -d --build
 | `/turns` | 做青轮次编排 | 摇青 / 静置交替时间线与累计时长、失水率走势；**HTML5 原生拖拽排序**写回 `roundNo`；复制上一轮参数后微调、参数模板存 / 套用 |
 | `/fixing` | 杀青揉捻记录 | 锅温、杀青时长、揉捻压力与时长、操作人登记；登记后自动把批次回写为「已杀青」 |
 | `/roasting` | 焙火曲线与复焙安排 | 多道次按序排列（上移 / 下移写回 `passNo`）、足火判定（轻火 / 中火 / 足火）、复焙提醒（逾期 / 今日 / 7 日内 / 已排期） |
+| `/workbench` | 拆批 / 合回工作台 | 杀青后分路焙火：拆批写清各支公斤与余量、合计对回原批次、分支继承拆分前工艺为只读底稿；合回只接同山场 / 品种 / 工序分支，新批次按分支重量相加、审评分按毛茶重量加权，结果一变立即失效并撤出拼配候选 |
 | `/reviews` | 毛茶审评 | 香气 30% / 汤色 20% / 滋味 35% / 叶底 15% 加权换算总分，按总分排序并生成拼配候选清单 |
 | `/blending` | 拼配方案登记与结构版本导出 | 按总分组合批次与占比、**占比校验（合计必须 100%）**、方案 JSON 与整库结构版本 JSON 导出 |
 
@@ -97,35 +98,42 @@ sologsb101-1023/
         ├── App.tsx                 # 外壳：侧边导航、当前山场/批次、行数统计、首次初始化 + 播种
         ├── vite-env.d.ts
         ├── styles/main.css         # 墨绿/茶褐/炭金主题与拖拽、时间线样式
-        ├── types/                  # 六个实体各一文件
+        ├── types/                  # 实体类型：拆批 / 合回新增 split.ts、merge.ts
         │   ├── garden.ts           # 山场：name / altitudeM / soil / cultivar / aspect
-        │   ├── batch.ts            # 茶青批次：gardenId / pickedAt / freshLeafKg / tenderness / weather / state
+        │   ├── batch.ts            # 茶青批次：gardenId / pickedAt / freshLeafKg / tenderness / weather / state / lineage / revision / maochaKg
         │   ├── turn.ts             # 做青轮次：batchId / roundNo / shakeMin / restMin / roomTempC / humidityPct / waterLossPct
         │   ├── fix.ts              # 杀青揉捻：batchId / wokTempC / fixMin / rollPressure / rollMin / operator
         │   ├── roast.ts            # 焙火：batchId / passNo / tempC / hours / charcoal / nextRoastDate / state
+        │   ├── split.ts            # 拆批记录 / 分支 / 只读工艺底稿（split / branch / remainder 血缘）
+        │   ├── merge.ts            # 合回记录 / 状态机（draft / confirmed / stale / failed）
         │   └── review.ts           # 审评：batchId / reviewedAt / aroma / liquorColor / taste / leafBase / totalScore / blendNote
         ├── stores/                 # Zustand：跨页状态全部放这里
         │   ├── gardenStore.ts      # 山场列表、派生指标、当前选中山场、筛选条件
         │   ├── batchStore.ts       # 批次与工序流转、杀青/审评/拼配筛选、拼配方案草稿
         │   ├── turnStore.ts        # 当前批次轮次、参数模板、拖拽重排（写回 roundNo）
-        │   └── roastStore.ts       # 焙火道次顺序、复焙提醒、足火判定
+        │   ├── roastStore.ts       # 焙火道次顺序、复焙提醒、足火判定
+        │   └── splitMergeStore.ts  # 拆批乐观锁提交、合回创建 / 失效监听 / 重算 / 确认
         ├── components/common/      # 共享组件
         │   ├── GradeTag.tsx        # 嫩度 / 火功 / 评分 / 工序状态 / 焙火状态 / 揉捻压力标签
+        │   ├── BaselinePanel.tsx   # 拆分前工艺只读底稿（做青 / 杀青 / 焙火页与工作台复用）
         │   ├── FilterBar.tsx       # 关键字 + 多个下拉多选，并同步 URL query
         │   ├── StatBadge.tsx       # 统计徽标（累计时长、失水率、均分、热负荷…）
         │   └── EmptyPanel.tsx      # 空数据引导 + 主/次操作按钮
         ├── hooks/
         │   ├── useTurnTimeline.ts  # 轮次累计摇青/静置时长、交替时间线段、失水率走势
+        │   ├── useBranchBaseline.ts# 拆批分支继承的只读工艺底稿
         │   └── useIdbTable.ts      # Dexie 表响应式订阅 + 增删改查封装
         ├── utils/
         │   ├── tea.ts              # 嫩度/火功枚举映射、温湿度与失水率区间判定、评分加权换算、拼配候选
-        │   ├── db.ts               # Dexie 实例、六张表、version(1) + version(2) 迁移、播种、快照导入导出
+        │   ├── splitMerge.ts       # 拆批重量合计 / 合回分组 / 毛茶重量加权 / 失效指纹（纯函数）
+        │   ├── db.ts               # Dexie 实例、表结构与版本迁移、播种、快照导入导出
         │   └── export.ts           # 批次工艺记录 / 整库存档 / 拼配方案 JSON 导出与校验
-        ├── pages/                  # 六个页面，与路由一一对应
+        ├── pages/                  # 页面，与路由一一对应
         │   ├── GardenList.tsx      # /gardens
         │   ├── TurnBoard.tsx       # /turns
         │   ├── FixRecord.tsx       # /fixing
         │   ├── RoastPlan.tsx       # /roasting
+        │   ├── Workbench.tsx       # /workbench 拆批 / 合回
         │   ├── ReviewBoard.tsx     # /reviews
         │   └── BlendPlan.tsx       # /blending
         └── router/index.tsx        # 路由表：/ 与未知路径重定向到 /gardens，页面懒加载
@@ -136,13 +144,20 @@ sologsb101-1023/
 ## 六、IndexedDB 库名与数据存储说明
 
 - **库名**：`gbtearock`（`src/utils/db.ts` 中的 `DB_NAME`）
-- **结构版本号**：`DB_VERSION = 2`
+- **结构版本号**：`DB_VERSION = 3`
   - `version(1)` 初版结构：六张分表的最小索引
   - `version(2).stores(...)` 补齐外键 / 状态 / 日期索引，并 `.upgrade()` **真实迁移历史数据**：补齐 `createdAt` / `updatedAt`、山场补齐朝向与土壤品种兜底值、批次工序状态归一化、轮次与焙火数值截断到合法区间、审评总分由「四项简单平均」改为「分项加权换算」后重算。
-- **分表**：`gardens`、`batches`、`turns`、`fixes`、`roasts`、`reviews`（每条记录都有 `id` / `createdAt` / `updatedAt`）
+  - `version(3)` 上线「拆批 / 合回」：批次补 `lineage`（single / remainder / branch / merged 血缘）、`revision`（乐观锁版本）、`maochaKg`（毛茶重量，缺省取鲜叶重量）、`mergedInto`；新增 `splits`（拆批记录）、`baselines`（拆分前工艺只读底稿）、`merges`（合回记录）三表。**旧数据与旧存档一律按单支批次兼容**（`lineage={kind:'single'}`、毛茶重量取鲜叶重量）。
+- **分表**：`gardens`、`batches`、`turns`、`fixes`、`roasts`、`reviews`、`splits`、`baselines`、`merges`（每条记录都有 `id` / `createdAt` / `updatedAt`）
+- **拆批 / 合回语义**：
+  - **拆批**：杀青后才可拆；提交时各支公斤 + 余量必须合计对回原批次重量（每支 > 0、至少两路）。母批保留余量（`remainder`，重量改为余量），各支为独立 `branch` 批次并把拆分前的做青 / 杀青 / 焙火快照存为**只读底稿**（`baselines`），在做青 / 杀青 / 焙火页只读展示。
+  - **并发拆分**：母批带 `revision` 乐观锁。两个页签同时拆同一母批时，后提交方在事务内发现版本已变 → 抛 `SplitConflictError`，弹窗展示**最新剩余量**、表单草稿保留在 `localStorage`，可按最新余量调整后重试，绝不覆盖先提交结果。
+  - **合回**：只接**同山场、品种、工序**且尚未合回的分支（`buildMergeGroups`）。新批次重量 = 各分支毛茶重量相加；审评分按各支**毛茶重量加权**（有审评的支计入分母）。
+  - **失效与撤下**：合回记录带指纹（各支版本 + 毛茶重量 + 审评总分）。分支重量或审评分一变，`liveQuery` 监听立即把记录置为 `stale`，未确认结果与失效结果从拼配候选撤下（`isBatchBlendEligible`）。
+  - **重算**：重算失败时保留旧结果并置 `failed`、允许重试；确认时生成新批次（`merged`）与加权审评，参与分支写入 `mergedInto` 退出候选。已参与拆批 / 合回的批次禁止删除以保留来源。
 - **首屏自动播种**：`initDatabase()` 中 `if ((await db.gardens.count()) === 0) { await seedDatabase() }`，播种 3 层互相引用的演示数据 —— 3 个山场 → 4 个茶青批次 → 每个批次下 2-3 条做青轮次、1 条杀青揉捻、1-2 道焙火、1 条审评，父→子→孙贯通；播种使用固定 id + `bulkPut`，**幂等**，重复执行不会产生重复行。
-- **级联删除**：删除山场会级联删除其批次与批次下的轮次 / 杀青 / 焙火 / 审评；删除批次会级联删除其全部工序子表（均使用 `db.transaction`）。
-- **导出 / 导入**：山场页支持「导出整库 JSON / 导入 JSON」（Blob + `URL.createObjectURL` + `a.download`，导入前做结构与库名校验，校验失败弹错误提示）；拼配页支持拼配方案 JSON 与整库结构版本 JSON 导出。
+- **级联删除**：删除山场会级联删除其批次与批次下的轮次 / 杀青 / 焙火 / 审评；删除普通批次会级联删除其全部工序子表（均使用 `db.transaction`）；已参与拆批 / 合回的批次拒绝删除。
+- **导出 / 导入**：山场页支持「导出整库 JSON / 导入 JSON」（Blob + `URL.createObjectURL` + `a.download`，导入前做结构与库名校验，v1/v2 旧档缺省拆并三表、批次按单支兜底，校验失败弹错误提示）；拼配页支持拼配方案 JSON 与整库结构版本 JSON 导出。
 - **无命名卷、无数据库服务**：容器只托管静态文件，数据完全存在浏览器本地，换浏览器或清空站点数据即清空。
 
 ---

@@ -12,13 +12,15 @@ import { TURN_LIMITS, type Turn } from '../types/turn';
 import type { Fix } from '../types/fix';
 import { ROAST_STATES, type Roast } from '../types/roast';
 import type { Review } from '../types/review';
+import type { ProcessBaseline, SplitRecord } from '../types/split';
+import type { MergeRecord } from '../types/merge';
 import { clampScore, weightedTotalScore } from './tea';
 
 /** 数据库名 = 英文短名 */
 export const DB_NAME = 'gbtearock';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_VERSION = 2;
+export const DB_VERSION = 3;
 
 /** 主键前缀，便于在导出 JSON 里肉眼区分实体 */
 export const ID_PREFIX = {
@@ -28,6 +30,9 @@ export const ID_PREFIX = {
   fix: 'fix',
   roast: 'roast',
   review: 'review',
+  split: 'split',
+  baseline: 'baseline',
+  merge: 'merge',
 } as const;
 
 class TeaRockDatabase extends Dexie {
@@ -37,10 +42,15 @@ class TeaRockDatabase extends Dexie {
   fixes!: Table<Fix, string>;
   roasts!: Table<Roast, string>;
   reviews!: Table<Review, string>;
+  /** 拆批记录 */
+  splits!: Table<SplitRecord, string>;
+  /** 拆分前工艺只读底稿 */
+  baselines!: Table<ProcessBaseline, string>;
+  /** 合回记录 */
+  merges!: Table<MergeRecord, string>;
 
   constructor() {
     super(DB_NAME);
-
     // v1：初版结构（只保留最小索引，历史数据沿用 id 主键）
     this.version(1).stores({
       gardens: 'id, name, cultivar',
@@ -152,6 +162,38 @@ class TeaRockDatabase extends Dexie {
               taste: row.taste,
               leafBase: row.leafBase,
             });
+          });
+      });
+
+    // v3：杀青后分路焙火「拆批 / 合回」工作台
+    //     1) 批次补 lineage（血缘）/ revision（乐观锁）/ maochaKg（毛茶重量）/ mergedInto；
+    //     2) 新增 splits（拆批记录）/ baselines（只读工艺底稿）/ merges（合回记录）三表。
+    //     旧数据一律按单支批次兼容：lineage = { kind: 'single' }，毛茶重量缺省取鲜叶重量。
+    this.version(DB_VERSION)
+      .stores({
+        gardens: 'id, name, cultivar, soil, altitudeM, createdAt, updatedAt',
+        batches:
+          'id, gardenId, pickedAt, state, tenderness, revision, mergedInto, [gardenId+state], createdAt, updatedAt',
+        turns: 'id, batchId, roundNo, [batchId+roundNo], createdAt, updatedAt',
+        fixes: 'id, batchId, operator, createdAt, updatedAt',
+        roasts: 'id, batchId, passNo, state, nextRoastDate, createdAt, updatedAt',
+        reviews: 'id, batchId, reviewedAt, totalScore, createdAt, updatedAt',
+        splits: 'id, sourceBatchId, baselineId, createdAt, updatedAt',
+        baselines: 'id, splitId, sourceBatchId, createdAt, updatedAt',
+        merges: 'id, status, outputBatchId, computedAt, createdAt, updatedAt',
+      })
+      .upgrade((tx) => {
+        return tx
+          .table<Batch, string>('batches')
+          .toCollection()
+          .modify((row) => {
+            // 旧数据按单支批次兼容
+            if (!row.lineage) row.lineage = { kind: 'single' };
+            if (typeof row.revision !== 'number' || !Number.isFinite(row.revision)) row.revision = 1;
+            if (typeof row.mergedInto !== 'string') row.mergedInto = null;
+            if (typeof row.maochaKg !== 'number' || !Number.isFinite(row.maochaKg) || row.maochaKg <= 0) {
+              row.maochaKg = row.freshLeafKg;
+            }
           });
       });
   }
@@ -524,8 +566,18 @@ export async function putBatches(rows: Batch[]): Promise<void> {
   await db.batches.bulkPut(rows);
 }
 
-/** 删除批次：级联删除轮次 / 杀青 / 焙火 / 审评 */
+/** 删除批次：级联删除轮次 / 杀青 / 焙火 / 审评；已参与拆批或合回的批次禁止删除（来源必须可追溯） */
 export async function removeBatch(id: string): Promise<void> {
+  const [splitOut, splitRemain, mergeHit] = await Promise.all([
+    db.splits.where('sourceBatchId').equals(id).count(),
+    db.baselines.where('sourceBatchId').equals(id).count(),
+    db.merges
+      .filter((row) => row.branches.some((branch) => branch.batchId === id) || row.outputBatchId === id)
+      .count(),
+  ]);
+  if (splitOut > 0 || splitRemain > 0 || mergeHit > 0) {
+    throw new Error('该批次已参与拆批或合回，来源需留档，不能删除');
+  }
   await db.transaction('rw', db.batches, db.turns, db.fixes, db.roasts, db.reviews, async () => {
     await db.turns.where('batchId').equals(id).delete();
     await db.fixes.where('batchId').equals(id).delete();
@@ -622,6 +674,61 @@ export async function removeReview(id: string): Promise<void> {
   await db.reviews.delete(id);
 }
 
+/* ------------------------------ 拆批 / 底稿 ------------------------------ */
+
+export async function listSplits(): Promise<SplitRecord[]> {
+  const rows = await db.splits.toArray();
+  return rows.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+}
+
+export async function listSplitsBySource(sourceBatchId: string): Promise<SplitRecord[]> {
+  const rows = await db.splits.where('sourceBatchId').equals(sourceBatchId).toArray();
+  return rows.sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+}
+
+export async function getSplit(id: string): Promise<SplitRecord | undefined> {
+  return db.splits.get(id);
+}
+
+export async function putSplit(row: SplitRecord): Promise<void> {
+  await db.splits.put(row);
+}
+
+export async function listBaselines(): Promise<ProcessBaseline[]> {
+  return db.baselines.toArray();
+}
+
+export async function getBaseline(id: string): Promise<ProcessBaseline | undefined> {
+  return db.baselines.get(id);
+}
+
+export async function putBaseline(row: ProcessBaseline): Promise<void> {
+  await db.baselines.put(row);
+}
+
+/* -------------------------------- 合回 -------------------------------- */
+
+export async function listMerges(): Promise<MergeRecord[]> {
+  const rows = await db.merges.toArray();
+  return rows.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+}
+
+export async function getMerge(id: string): Promise<MergeRecord | undefined> {
+  return db.merges.get(id);
+}
+
+export async function putMerge(row: MergeRecord): Promise<void> {
+  await db.merges.put(row);
+}
+
+export async function bulkPutMerges(rows: MergeRecord[]): Promise<void> {
+  await db.merges.bulkPut(rows);
+}
+
+export async function removeMerge(id: string): Promise<void> {
+  await db.merges.delete(id);
+}
+
 /* ---------------------------- 整库导入导出 ---------------------------- */
 
 /** 整库快照（导出 / 导入 JSON 的结构） */
@@ -635,53 +742,106 @@ export interface DatabaseSnapshot {
   fixes: Fix[];
   roasts: Roast[];
   reviews: Review[];
+  /** v3 起：拆批记录 / 只读底稿 / 合回记录；旧档导入时缺省为空 */
+  splits?: SplitRecord[];
+  baselines?: ProcessBaseline[];
+  merges?: MergeRecord[];
 }
 
 /** 导出整库快照 */
 export async function exportSnapshot(): Promise<DatabaseSnapshot> {
-  const [gardens, batches, turns, fixes, roasts, reviews] = await Promise.all([
+  const [gardens, batches, turns, fixes, roasts, reviews, splits, baselines, merges] = await Promise.all([
     db.gardens.toArray(),
     db.batches.toArray(),
     db.turns.toArray(),
     db.fixes.toArray(),
     db.roasts.toArray(),
     db.reviews.toArray(),
+    db.splits.toArray(),
+    db.baselines.toArray(),
+    db.merges.toArray(),
   ]);
-  return { name: DB_NAME, schemaVersion: DB_VERSION, exportedAt: nowIso(), gardens, batches, turns, fixes, roasts, reviews };
+  return {
+    name: DB_NAME,
+    schemaVersion: DB_VERSION,
+    exportedAt: nowIso(),
+    gardens,
+    batches,
+    turns,
+    fixes,
+    roasts,
+    reviews,
+    splits,
+    baselines,
+    merges,
+  };
 }
 
-/** 用快照覆盖整库（导入存档） */
+/** 用快照覆盖整库（导入存档）；旧档无拆并三表时按空表处理（单支批次兼容） */
 export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
-  await db.transaction('rw', [db.gardens, db.batches, db.turns, db.fixes, db.roasts, db.reviews], async () => {
-    await Promise.all([
-      db.gardens.clear(),
-      db.batches.clear(),
-      db.turns.clear(),
-      db.fixes.clear(),
-      db.roasts.clear(),
-      db.reviews.clear(),
-    ]);
-    await db.gardens.bulkPut(snapshot.gardens);
-    await db.batches.bulkPut(snapshot.batches);
-    await db.turns.bulkPut(snapshot.turns);
-    await db.fixes.bulkPut(snapshot.fixes);
-    await db.roasts.bulkPut(snapshot.roasts);
-    await db.reviews.bulkPut(snapshot.reviews);
-  });
+  await db.transaction(
+    'rw',
+    [db.gardens, db.batches, db.turns, db.fixes, db.roasts, db.reviews, db.splits, db.baselines, db.merges],
+    async () => {
+      await Promise.all([
+        db.gardens.clear(),
+        db.batches.clear(),
+        db.turns.clear(),
+        db.fixes.clear(),
+        db.roasts.clear(),
+        db.reviews.clear(),
+        db.splits.clear(),
+        db.baselines.clear(),
+        db.merges.clear(),
+      ]);
+      // 旧数据（含更早导出的存档）统一按单支批次兜底
+      const batches = (snapshot.batches ?? []).map((row) => normalizeImportedBatch(row));
+      await db.gardens.bulkPut(snapshot.gardens ?? []);
+      await db.batches.bulkPut(batches);
+      await db.turns.bulkPut(snapshot.turns ?? []);
+      await db.fixes.bulkPut(snapshot.fixes ?? []);
+      await db.roasts.bulkPut(snapshot.roasts ?? []);
+      await db.reviews.bulkPut(snapshot.reviews ?? []);
+      if (snapshot.splits?.length) await db.splits.bulkPut(snapshot.splits);
+      if (snapshot.baselines?.length) await db.baselines.bulkPut(snapshot.baselines);
+      if (snapshot.merges?.length) await db.merges.bulkPut(snapshot.merges);
+    },
+  );
+}
+
+/** 导入批次兜底：补齐 v3 血缘 / 版本 / 毛茶重量字段（旧档按单支批次兼容） */
+export function normalizeImportedBatch(row: Batch): Batch {
+  return {
+    ...row,
+    lineage: row.lineage ?? { kind: 'single' },
+    revision: typeof row.revision === 'number' && Number.isFinite(row.revision) ? row.revision : 1,
+    mergedInto: typeof row.mergedInto === 'string' ? row.mergedInto : null,
+    maochaKg:
+      typeof row.maochaKg === 'number' && Number.isFinite(row.maochaKg) && row.maochaKg > 0
+        ? row.maochaKg
+        : row.freshLeafKg,
+  };
 }
 
 /** 清空全部表（不重新播种） */
 export async function clearAllTables(): Promise<void> {
-  await db.transaction('rw', [db.gardens, db.batches, db.turns, db.fixes, db.roasts, db.reviews], async () => {
-    await Promise.all([
-      db.gardens.clear(),
-      db.batches.clear(),
-      db.turns.clear(),
-      db.fixes.clear(),
-      db.roasts.clear(),
-      db.reviews.clear(),
-    ]);
-  });
+  await db.transaction(
+    'rw',
+    [db.gardens, db.batches, db.turns, db.fixes, db.roasts, db.reviews, db.splits, db.baselines, db.merges],
+    async () => {
+      await Promise.all([
+        db.gardens.clear(),
+        db.batches.clear(),
+        db.turns.clear(),
+        db.fixes.clear(),
+        db.roasts.clear(),
+        db.reviews.clear(),
+        db.splits.clear(),
+        db.baselines.clear(),
+        db.merges.clear(),
+      ]);
+    },
+  );
 }
 
 /** 清空全部数据并重新灌入演示数据 */
@@ -692,13 +852,16 @@ export async function resetDatabase(): Promise<void> {
 
 /** 各表行数概览（页脚与统计徽标使用） */
 export async function countAll(): Promise<Record<string, number>> {
-  const [gardens, batches, turns, fixes, roasts, reviews] = await Promise.all([
+  const [gardens, batches, turns, fixes, roasts, reviews, splits, baselines, merges] = await Promise.all([
     db.gardens.count(),
     db.batches.count(),
     db.turns.count(),
     db.fixes.count(),
     db.roasts.count(),
     db.reviews.count(),
+    db.splits.count(),
+    db.baselines.count(),
+    db.merges.count(),
   ]);
-  return { gardens, batches, turns, fixes, roasts, reviews };
+  return { gardens, batches, turns, fixes, roasts, reviews, splits, baselines, merges };
 }

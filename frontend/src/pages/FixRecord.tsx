@@ -4,9 +4,10 @@
  * - 登记 / 修改后回写所属批次状态为「已杀青」（工序自动流转）
  * - 关键字 + 山场 / 批次 / 揉捻压力筛选，删除确认，统计徽标与空数据引导
  */
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   App,
+  Alert,
   Button,
   Card,
   Col,
@@ -30,9 +31,12 @@ import EmptyPanel from '../components/common/EmptyPanel';
 import { useIdbTable } from '../hooks/useIdbTable';
 import { useGardenStore } from '../stores/gardenStore';
 import { filterFixes, useBatchStore } from '../stores/batchStore';
+import { useSplitMergeStore } from '../stores/splitMergeStore';
+import BaselinePanel from '../components/common/BaselinePanel';
 import { db } from '../utils/db';
 import { FIX_LIMITS, ROLL_PRESSURE_OPTIONS, type Fix, type FixDraft } from '../types/fix';
 import { batchLabel, judgeFixLevel, roundTo } from '../utils/tea';
+import { isBranchBatch } from '../utils/splitMerge';
 
 export default function FixRecord() {
   const { message, modal } = App.useApp();
@@ -53,6 +57,25 @@ export default function FixRecord() {
 
   const gardenMap = useMemo(() => new Map(gardens.map((garden) => [garden.id, garden])), [gardens]);
   const batchMap = useMemo(() => new Map(batches.map((batch) => [batch.id, batch])), [batches]);
+
+  // 拆批分支：展示继承自母批的杀青揉捻只读底稿
+  const branchBatches = useMemo(() => batches.filter((batch) => isBranchBatch(batch)), [batches]);
+  const baselines = useSplitMergeStore((state) => state.baselines);
+  const loadSplitMerge = useSplitMergeStore((state) => state.loadAll);
+  const branchBaselines = useMemo(
+    () =>
+      branchBatches
+        .map((batch) => {
+          const lineage = batch.lineage;
+          if (!lineage || lineage.kind !== 'branch') return null;
+          return baselines.find((item) => item.id === lineage.baselineId) ?? null;
+        })
+        .filter((item): item is NonNullable<typeof item> => item !== null && Boolean(item.fix)),
+    [baselines, branchBatches],
+  );
+  useEffect(() => {
+    void loadSplitMerge();
+  }, [loadSplitMerge]);
 
   const rows = useMemo(
     () => filterFixes(fixesTable.rows, batches, gardens, fixFilters),
@@ -275,6 +298,30 @@ export default function FixRecord() {
         onReset={resetFixFilters}
         placeholder="搜索操作人 / 批次 / 锅温"
       />
+
+      {branchBaselines.length > 0 ? (
+        <Alert
+          style={{ marginBottom: 12 }}
+          type="info"
+          showIcon
+          message={`以下 ${branchBaselines.length} 份拆批分支继承了拆分前杀青揉捻只读底稿（本页登记的是拆分后新增记录）`}
+          description={
+            <Space direction="vertical" size={10} style={{ width: '100%' }}>
+              {branchBaselines.map((baseline) => {
+                const source = batchMap.get(baseline.sourceBatchId);
+                return (
+                  <BaselinePanel
+                    key={baseline.id}
+                    baseline={baseline}
+                    section="fix"
+                    sourceLabel={source ? batchLabel(source, gardenMap.get(baseline.sourceBatchId)?.name) : undefined}
+                  />
+                );
+              })}
+            </Space>
+          }
+        />
+      ) : null}
 
       {fixesTable.error ? (
         <EmptyPanel size="small" title="本地数据读取失败" description={fixesTable.error} secondaryText="重试" onSecondary={() => void fixesTable.refresh()} />

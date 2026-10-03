@@ -13,6 +13,7 @@ const FixRecord = lazy(() => import('../pages/FixRecord'));
 const RoastPlan = lazy(() => import('../pages/RoastPlan'));
 const ReviewBoard = lazy(() => import('../pages/ReviewBoard'));
 const BlendPlan = lazy(() => import('../pages/BlendPlan'));
+const Workbench = lazy(() => import('../pages/Workbench'));
 
 /** 全部路由路径（逐字固定，禁止改动） */
 export const ROUTES = {
@@ -22,6 +23,7 @@ export const ROUTES = {
   roasting: '/roasting',
   reviews: '/reviews',
   blending: '/blending',
+  workbench: '/workbench',
 } as const;
 
 /** 导航标题：App 依据当前路径设置 document.title */
@@ -32,6 +34,7 @@ export const ROUTE_META: Record<string, string> = {
   [ROUTES.roasting]: '焙火曲线与复焙安排',
   [ROUTES.reviews]: '毛茶审评',
   [ROUTES.blending]: '拼配方案登记',
+  [ROUTES.workbench]: '拆批 / 合回工作台',
 };
 
 /** 侧边导航顺序 */
@@ -40,6 +43,7 @@ export const NAV_ORDER: string[] = [
   ROUTES.turns,
   ROUTES.fixing,
   ROUTES.roasting,
+  ROUTES.workbench,
   ROUTES.reviews,
   ROUTES.blending,
 ];
@@ -64,6 +68,7 @@ export const appRoutes: RouteObject[] = [
       { path: 'turns', element: withSuspense(<TurnBoard />) },
       { path: 'fixing', element: withSuspense(<FixRecord />) },
       { path: 'roasting', element: withSuspense(<RoastPlan />) },
+      { path: 'workbench', element: withSuspense(<Workbench />) },
       { path: 'reviews', element: withSuspense(<ReviewBoard />) },
       { path: 'blending', element: withSuspense(<BlendPlan />) },
       { path: '*', element: <Navigate to={ROUTES.gardens} replace /> },

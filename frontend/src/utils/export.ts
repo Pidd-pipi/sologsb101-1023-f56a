@@ -11,7 +11,9 @@ import type { Turn } from '../types/turn';
 import type { Fix } from '../types/fix';
 import type { Roast } from '../types/roast';
 import type { Review } from '../types/review';
-import { DB_NAME, DB_VERSION, type DatabaseSnapshot } from './db';
+import type { ProcessBaseline, SplitRecord } from '../types/split';
+import type { MergeRecord } from '../types/merge';
+import { DB_NAME, DB_VERSION, normalizeImportedBatch, type DatabaseSnapshot } from './db';
 import { batchLabel, isRatioValid, roundTo } from './tea';
 
 /* ------------------------------ 通用下载 ------------------------------ */
@@ -155,16 +157,23 @@ export function parseSnapshotJson(text: string): DatabaseSnapshot {
   assertRows(raw.fixes, 'fixes');
   assertRows(raw.roasts, 'roasts');
   assertRows(raw.reviews, 'reviews');
+  // v3 新增三表：旧档（v1/v2 导出）允许缺省，按空表 + 单支批次兼容
+  if (raw.splits !== undefined) assertRows(raw.splits, 'splits');
+  if (raw.baselines !== undefined) assertRows(raw.baselines, 'baselines');
+  if (raw.merges !== undefined) assertRows(raw.merges, 'merges');
   return {
     name: DB_NAME,
     schemaVersion: typeof raw.schemaVersion === 'number' ? raw.schemaVersion : DB_VERSION,
     exportedAt: typeof raw.exportedAt === 'string' ? raw.exportedAt : new Date().toISOString(),
     gardens: raw.gardens as DatabaseSnapshot['gardens'],
-    batches: raw.batches as DatabaseSnapshot['batches'],
+    batches: (raw.batches as DatabaseSnapshot['batches']).map((row) => normalizeImportedBatch(row)),
     turns: raw.turns as DatabaseSnapshot['turns'],
     fixes: raw.fixes as DatabaseSnapshot['fixes'],
     roasts: raw.roasts as DatabaseSnapshot['roasts'],
     reviews: raw.reviews as DatabaseSnapshot['reviews'],
+    splits: (raw.splits ?? []) as SplitRecord[],
+    baselines: (raw.baselines ?? []) as ProcessBaseline[],
+    merges: (raw.merges ?? []) as MergeRecord[],
   };
 }
 

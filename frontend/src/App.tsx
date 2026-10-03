@@ -6,6 +6,7 @@ import { useEffect, useMemo, type ReactNode } from 'react';
 import { Link, Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { Badge, Button, Layout, Menu, Space, Tag, Typography, message } from 'antd';
 import {
+  ApartmentOutlined,
   AppstoreOutlined,
   ExperimentOutlined,
   FireOutlined,
@@ -17,6 +18,7 @@ import { NAV_ORDER, ROUTES, ROUTE_META } from './router';
 import { useGardenStore } from './stores/gardenStore';
 import { useBatchStore } from './stores/batchStore';
 import { useRoastStore } from './stores/roastStore';
+import { useSplitMergeStore } from './stores/splitMergeStore';
 import { initDatabase } from './utils/db';
 import { batchLabel } from './utils/tea';
 
@@ -28,6 +30,7 @@ const NAV_ICON: Record<string, ReactNode> = {
   '/turns': <ExperimentOutlined />,
   '/fixing': <GoldOutlined />,
   '/roasting': <FireOutlined />,
+  '/workbench': <ApartmentOutlined />,
   '/reviews': <StarOutlined />,
   '/blending': <ProfileOutlined />,
 };
@@ -50,6 +53,9 @@ export default function App() {
 
   const loadRoasts = useRoastStore((state) => state.loadRoasts);
 
+  const loadSplitMerge = useSplitMergeStore((state) => state.loadAll);
+  const startStalenessWatch = useSplitMergeStore((state) => state.startStalenessWatch);
+
   // 首次进入：打开数据库（必要时播种）→ 加载各 store 的跨页数据
   useEffect(() => {
     let cancelled = false;
@@ -57,7 +63,7 @@ export default function App() {
       try {
         await initDatabase();
         if (cancelled) return;
-        await Promise.all([loadGardens(), loadBatches(), loadRoasts(), loadReviews()]);
+        await Promise.all([loadGardens(), loadBatches(), loadRoasts(), loadReviews(), loadSplitMerge()]);
       } catch (error) {
         if (cancelled) return;
         messageApi.error(`本地数据库初始化失败：${error instanceof Error ? error.message : '未知错误'}`);
@@ -66,7 +72,10 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [loadBatches, loadGardens, loadReviews, loadRoasts, messageApi]);
+  }, [loadBatches, loadGardens, loadReviews, loadRoasts, loadSplitMerge, messageApi]);
+
+  // 分支重量 / 审评分一变，立即把受影响合回标记失效（全应用、跨页签）
+  useEffect(() => startStalenessWatch(), [startStalenessWatch]);
 
   // 导航标题（每个路由带 meta.title 的等价实现）
   useEffect(() => {

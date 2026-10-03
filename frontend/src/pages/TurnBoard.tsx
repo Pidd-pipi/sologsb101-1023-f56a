@@ -7,6 +7,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   App,
+  Alert,
   Button,
   Card,
   Col,
@@ -38,7 +39,9 @@ import FilterBar, { type FilterSelectConfig } from '../components/common/FilterB
 import GradeTag from '../components/common/GradeTag';
 import StatBadge from '../components/common/StatBadge';
 import EmptyPanel from '../components/common/EmptyPanel';
+import BaselinePanel from '../components/common/BaselinePanel';
 import { useTurnTimeline } from '../hooks/useTurnTimeline';
+import { useBranchBaseline } from '../hooks/useBranchBaseline';
 import { useGardenStore } from '../stores/gardenStore';
 import { useBatchStore } from '../stores/batchStore';
 import {
@@ -103,6 +106,7 @@ export default function TurnBoard() {
 
   const activeBatch = batches.find((batch) => batch.id === activeBatchId) ?? null;
   const timeline = useTurnTimeline(activeBatchId);
+  const baseline = useBranchBaseline(activeBatchId);
 
   const orderedTurns = useMemo(() => [...turns].sort((a, b) => a.roundNo - b.roundNo), [turns]);
   const filteredTurns = useMemo(() => filterTurns(orderedTurns, filters), [orderedTurns, filters]);
@@ -401,6 +405,21 @@ export default function TurnBoard() {
         />
       ) : (
         <>
+          {baseline ? (
+            <Alert
+              style={{ marginBottom: 12 }}
+              type="info"
+              showIcon
+              message="该分支继承拆分前做青轮次为只读底稿，本页只登记拆分后的新增轮次"
+              description={
+                <BaselinePanel
+                  baseline={baseline}
+                  section="turns"
+                  sourceLabel={activeBatch ? labelOfBatch(activeBatch.id) : undefined}
+                />
+              }
+            />
+          ) : null}
           <div className="stat-row">
             <StatBadge label="轮次数" value={orderedTurns.length} suffix="轮" tone="primary" />
             <StatBadge label="累计摇青" value={timeline.totalShakeMin} suffix="分钟" />

@@ -4,7 +4,8 @@
  * 审评评分加权换算、拼配候选排序。不碰数据库、不碰 React。
  */
 import { ALTITUDE_BANDS, type Cultivar, type Garden, type Soil } from '../types/garden';
-import type { Batch, BatchState, Tenderness } from '../types/batch';
+import { type Batch, type BatchLineage, type BatchState, type Tenderness } from '../types/batch';
+import type { MergeRecord } from '../types/merge';
 import { TURN_LIMITS, type Turn } from '../types/turn';
 import type { FixLevel, RollPressure } from '../types/fix';
 import {
@@ -358,8 +359,29 @@ export function matchScoreBand(score: number, bandKeys: string[]): boolean {
 
 /* ----------------------------- 拼配候选 ----------------------------- */
 
-/** 按总分由高到低生成拼配候选清单 */
-export function buildBlendCandidates(reviews: Review[], batches: Batch[], gardens: Garden[]): BlendCandidate[] {
+/**
+ * 合回上下文：决定哪些批次要从拼配候选撤下。
+ * - 已合回分支（batch.mergedInto 有值）：撤下
+ * - 合回产生的新批次：仅当合回记录为 confirmed 才保留；draft / stale / failed 撤下
+ * 不传 merges 时（旧调用方）按「只撤已合回分支」兼容。
+ */
+export function isBatchBlendEligible(batch: Batch, merges: MergeRecord[] = []): boolean {
+  if (batch.mergedInto) return false;
+  const lineage: BatchLineage = batch.lineage ?? { kind: 'single' };
+  if (lineage.kind === 'merged') {
+    const record = merges.find((item) => item.id === lineage.mergeId);
+    return record?.status === 'confirmed';
+  }
+  return true;
+}
+
+/** 按总分由高到低生成拼配候选清单（撤下未确认合回结果与已合回分支） */
+export function buildBlendCandidates(
+  reviews: Review[],
+  batches: Batch[],
+  gardens: Garden[],
+  merges: MergeRecord[] = [],
+): BlendCandidate[] {
   const batchMap = new Map(batches.map((batch) => [batch.id, batch]));
   const gardenMap = new Map(gardens.map((garden) => [garden.id, garden]));
   return reviews
@@ -378,6 +400,10 @@ export function buildBlendCandidates(reviews: Review[], batches: Batch[], garden
         state: batch.state,
         pickedAt: batch.pickedAt,
       };
+    })
+    .filter((candidate) => {
+      const batch = batchMap.get(candidate.batchId);
+      return batch ? isBatchBlendEligible(batch, merges) : false;
     })
     .sort((a, b) => b.totalScore - a.totalScore);
 }
