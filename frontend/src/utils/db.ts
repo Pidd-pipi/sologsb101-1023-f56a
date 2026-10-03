@@ -7,18 +7,19 @@
  */
 import Dexie, { type Table } from 'dexie';
 import { CULTIVAR_OPTIONS, SOIL_OPTIONS, type Garden } from '../types/garden';
-import { BATCH_STATES, type Batch } from '../types/batch';
+import { BATCH_STATES, isBranchBatch, type Batch } from '../types/batch';
 import { TURN_LIMITS, type Turn } from '../types/turn';
 import type { Fix } from '../types/fix';
 import { ROAST_STATES, type Roast } from '../types/roast';
 import type { Review } from '../types/review';
-import { clampScore, weightedTotalScore } from './tea';
+import type { MergeRecord, MergeSource } from '../types/merge';
+import { clampScore, computeMergePreview, currentRemainingKg, roundTo, validateSplitRows, weightedTotalScore } from './tea';
 
 /** 数据库名 = 英文短名 */
 export const DB_NAME = 'gbtearock';
 
 /** 当前数据结构版本号（每次调整字段结构必须 +1 并补迁移） */
-export const DB_VERSION = 2;
+export const DB_VERSION = 3;
 
 /** 主键前缀，便于在导出 JSON 里肉眼区分实体 */
 export const ID_PREFIX = {
@@ -28,6 +29,7 @@ export const ID_PREFIX = {
   fix: 'fix',
   roast: 'roast',
   review: 'review',
+  merge: 'merge',
 } as const;
 
 class TeaRockDatabase extends Dexie {
@@ -37,6 +39,7 @@ class TeaRockDatabase extends Dexie {
   fixes!: Table<Fix, string>;
   roasts!: Table<Roast, string>;
   reviews!: Table<Review, string>;
+  merges!: Table<MergeRecord, string>;
 
   constructor() {
     super(DB_NAME);
@@ -152,6 +155,31 @@ class TeaRockDatabase extends Dexie {
               taste: row.taste,
               leafBase: row.leafBase,
             });
+          });
+      });
+
+    // v3：新增合回记录表 merges；批次补拆分 / 合回字段（旧数据按单支批次兼容）
+    this.version(3)
+      .stores({
+        gardens: 'id, name, cultivar, soil, altitudeM, createdAt, updatedAt',
+        batches:
+          'id, gardenId, pickedAt, state, tenderness, parentBatchId, branchNo, mergedFromBatchIds, originalFreshLeafKg, createdAt, updatedAt',
+        turns: 'id, batchId, roundNo, [batchId+roundNo], createdAt, updatedAt',
+        fixes: 'id, batchId, operator, createdAt, updatedAt',
+        roasts: 'id, batchId, passNo, state, nextRoastDate, createdAt, updatedAt',
+        reviews: 'id, batchId, reviewedAt, totalScore, createdAt, updatedAt',
+        merges: 'id, mergedBatchId, reviewId, gardenId, status, confirmedAt, createdAt, updatedAt',
+      })
+      .upgrade(async (tx) => {
+        // 旧批次没有拆分 / 合回字段，统一补默认值 → 全部视为单支批次
+        await tx
+          .table<Batch, string>('batches')
+          .toCollection()
+          .modify((row) => {
+            if (row.parentBatchId === undefined) row.parentBatchId = null;
+            if (row.branchNo === undefined) row.branchNo = null;
+            if (!Array.isArray(row.mergedFromBatchIds)) row.mergedFromBatchIds = [];
+            if (row.originalFreshLeafKg === undefined) row.originalFreshLeafKg = null;
           });
       });
   }
@@ -484,9 +512,9 @@ export async function putGarden(row: Garden): Promise<void> {
   await db.gardens.put(row);
 }
 
-/** 删除山场：级联删除其批次及批次下的轮次 / 杀青 / 焙火 / 审评 */
+/** 删除山场：级联删除其批次及批次下的轮次 / 杀青 / 焙火 / 审评 / 合回记录 */
 export async function removeGarden(id: string): Promise<void> {
-  await db.transaction('rw', [db.gardens, db.batches, db.turns, db.fixes, db.roasts, db.reviews], async () => {
+  await db.transaction('rw', [db.gardens, db.batches, db.turns, db.fixes, db.roasts, db.reviews, db.merges], async () => {
     const batches = await db.batches.where('gardenId').equals(id).toArray();
     const batchIds = batches.map((batch) => batch.id);
     if (batchIds.length > 0) {
@@ -494,8 +522,10 @@ export async function removeGarden(id: string): Promise<void> {
       await db.fixes.where('batchId').anyOf(batchIds).delete();
       await db.roasts.where('batchId').anyOf(batchIds).delete();
       await db.reviews.where('batchId').anyOf(batchIds).delete();
+      await db.merges.where('mergedBatchId').anyOf(batchIds).delete();
       await db.batches.where('gardenId').equals(id).delete();
     }
+    await db.merges.where('gardenId').equals(id).delete();
     await db.gardens.delete(id);
   });
 }
@@ -524,13 +554,14 @@ export async function putBatches(rows: Batch[]): Promise<void> {
   await db.batches.bulkPut(rows);
 }
 
-/** 删除批次：级联删除轮次 / 杀青 / 焙火 / 审评 */
+/** 删除批次：级联删除轮次 / 杀青 / 焙火 / 审评；若为合回产物一并删除合回记录 */
 export async function removeBatch(id: string): Promise<void> {
-  await db.transaction('rw', db.batches, db.turns, db.fixes, db.roasts, db.reviews, async () => {
+  await db.transaction('rw', [db.batches, db.turns, db.fixes, db.roasts, db.reviews, db.merges], async () => {
     await db.turns.where('batchId').equals(id).delete();
     await db.fixes.where('batchId').equals(id).delete();
     await db.roasts.where('batchId').equals(id).delete();
     await db.reviews.where('batchId').equals(id).delete();
+    await db.merges.where('mergedBatchId').equals(id).delete();
     await db.batches.delete(id);
   });
 }
@@ -622,6 +653,279 @@ export async function removeReview(id: string): Promise<void> {
   await db.reviews.delete(id);
 }
 
+/* -------------------------------- 合回记录 -------------------------------- */
+
+export async function listMerges(): Promise<MergeRecord[]> {
+  const rows = await db.merges.toArray();
+  return rows.sort((a, b) => b.confirmedAt.localeCompare(a.confirmedAt));
+}
+
+export async function getMerge(id: string): Promise<MergeRecord | undefined> {
+  return db.merges.get(id);
+}
+
+export async function getMergeByBatch(mergedBatchId: string): Promise<MergeRecord | undefined> {
+  return db.merges.where('mergedBatchId').equals(mergedBatchId).first();
+}
+
+export async function putMerge(row: MergeRecord): Promise<void> {
+  await db.merges.put(row);
+}
+
+export async function removeMerge(id: string): Promise<void> {
+  await db.merges.delete(id);
+}
+
+/* ------------------------------ 拆批（并发安全） ------------------------------ */
+
+/** 拆批的一支分支输入 */
+export interface SplitBranchInput {
+  kg: number;
+  /** 嫩度可选覆盖；缺省继承父批次 */
+  tenderness?: Batch['tenderness'];
+}
+
+export interface SplitResult {
+  parent: Batch;
+  branches: Batch[];
+}
+
+/**
+ * 拆批：在事务内重新读取父批次（最新余量），校验后写入分支并扣减余量。
+ * 乐观并发：两个页签并发拆分时，后提交方读到的是最新余量，校验不通过则整笔回滚、
+ * 不写入任何分支（调用方保留草稿），因此不会覆盖先提交结果。
+ */
+export async function splitBatch(parentId: string, rows: SplitBranchInput[]): Promise<SplitResult> {
+  return db.transaction('rw', [db.batches], async () => {
+    const parent = await db.batches.get(parentId);
+    if (!parent) throw new Error('未找到父批次，可能已被删除');
+    if (isBranchBatch(parent)) throw new Error('分支批次不能再次拆批');
+    // 事务内重新读取最新余量，避免并发拆分互相覆盖
+    const remaining = currentRemainingKg(parent);
+    const check = validateSplitRows(
+      remaining,
+      rows.map((row, index) => ({ key: String(index), kg: row.kg })),
+    );
+    if (check) throw new Error(check);
+
+    const stamp = nowIso();
+    const branchCount = await db.batches.where('parentBatchId').equals(parentId).count();
+    const branches: Batch[] = rows.map((row, index) => ({
+      id: createId(ID_PREFIX.batch),
+      gardenId: parent.gardenId,
+      pickedAt: parent.pickedAt,
+      freshLeafKg: roundTo(row.kg, 2),
+      tenderness: row.tenderness ?? parent.tenderness,
+      weather: parent.weather,
+      state: parent.state,
+      parentBatchId: parent.id,
+      branchNo: branchCount + index + 1,
+      mergedFromBatchIds: [],
+      originalFreshLeafKg: null,
+      createdAt: stamp,
+      updatedAt: stamp,
+    }));
+    const splitSum = roundTo(
+      branches.reduce((acc, branch) => acc + branch.freshLeafKg, 0),
+      2,
+    );
+    const nextParent: Batch = {
+      ...parent,
+      freshLeafKg: roundTo(remaining - splitSum, 2),
+      originalFreshLeafKg: parent.originalFreshLeafKg ?? parent.freshLeafKg,
+      updatedAt: stamp,
+    };
+    await db.batches.bulkPut(branches);
+    await db.batches.put(nextParent);
+    return { parent: nextParent, branches };
+  });
+}
+
+/* ------------------------------ 合回（确认 / 重算） ------------------------------ */
+
+export interface ConfirmMergeInput {
+  sources: MergeSource[];
+  totalWeightKg: number;
+  resultScore: number;
+  aroma: number;
+  liquorColor: number;
+  taste: number;
+  leafBase: number;
+}
+
+/** 组装合回来源快照（由调用方按当前分支 / 审评数据计算后传入） */
+export function buildMergeSources(params: {
+  branches: Batch[];
+  reviewsByBatch: Map<string, Review>;
+  gardens: Map<string, Garden>;
+}): MergeSource[] {
+  const { branches, reviewsByBatch, gardens } = params;
+  return branches.map((branch) => {
+    const review = reviewsByBatch.get(branch.id);
+    const garden = gardens.get(branch.gardenId);
+    if (!review) throw new Error(`分支「${branch.id}」缺少审评记录，无法合回`);
+    return {
+      batchId: branch.id,
+      batchLabel: `${garden?.name ?? '未知山场'} · ${branch.pickedAt} · 支${branch.branchNo ?? ''}`,
+      gardenId: branch.gardenId,
+      gardenName: garden?.name ?? '未知山场',
+      cultivar: garden?.cultivar ?? '未标注',
+      state: branch.state,
+      weightKg: branch.freshLeafKg,
+      reviewId: review.id,
+      totalScore: review.totalScore,
+      aroma: review.aroma,
+      liquorColor: review.liquorColor,
+      taste: review.taste,
+      leafBase: review.leafBase,
+    };
+  });
+}
+
+/** 确认合回：创建新茶青批次 + 加权审评 + 合回记录（一个事务） */
+export async function confirmMerge(input: ConfirmMergeInput): Promise<MergeRecord> {
+  return db.transaction('rw', [db.batches, db.reviews, db.merges, db.gardens], async () => {
+    const stamp = nowIso();
+    const sourceIds = input.sources.map((source) => source.batchId);
+    const branches = await db.batches.where('id').anyOf(sourceIds).toArray();
+    if (branches.length !== sourceIds.length) throw new Error('部分来源分支不存在，合回失败');
+    const gardenId = branches[0]?.gardenId;
+    const state = branches[0]?.state;
+    if (!gardenId || !state) throw new Error('来源分支信息不完整，无法合回');
+    if (!branches.every((branch) => branch.gardenId === gardenId && branch.state === state)) {
+      throw new Error('来源分支山场或工序不一致，不能合回');
+    }
+    const garden = gardenId ? await db.gardens.get(gardenId) : undefined;
+    const latestPickedAt = branches
+      .map((branch) => branch.pickedAt)
+      .sort()
+      .pop();
+    const mergedBatch: Batch = {
+      id: createId(ID_PREFIX.batch),
+      gardenId,
+      pickedAt: latestPickedAt ?? stamp.slice(0, 10),
+      freshLeafKg: input.totalWeightKg,
+      tenderness: branches[0]?.tenderness ?? '一芽三叶',
+      weather: `合回批次（${input.sources.length} 支）`,
+      state: '已审评',
+      parentBatchId: null,
+      branchNo: null,
+      mergedFromBatchIds: sourceIds,
+      originalFreshLeafKg: null,
+      createdAt: stamp,
+      updatedAt: stamp,
+    };
+    const review: Review = {
+      id: createId(ID_PREFIX.review),
+      batchId: mergedBatch.id,
+      reviewedAt: stamp.slice(0, 10),
+      aroma: input.aroma,
+      liquorColor: input.liquorColor,
+      taste: input.taste,
+      leafBase: input.leafBase,
+      totalScore: input.resultScore,
+      blendNote: `合回自 ${input.sources.length} 支分支`,
+      createdAt: stamp,
+      updatedAt: stamp,
+    };
+    const merge: MergeRecord = {
+      id: createId(ID_PREFIX.merge),
+      mergedBatchId: mergedBatch.id,
+      reviewId: review.id,
+      gardenId,
+      gardenName: garden?.name ?? '未知山场',
+      cultivar: garden?.cultivar ?? '未标注',
+      state,
+      sourceCount: input.sources.length,
+      totalWeightKg: input.totalWeightKg,
+      resultScore: input.resultScore,
+      status: 'confirmed',
+      sources: input.sources,
+      lastError: '',
+      confirmedAt: stamp,
+      createdAt: stamp,
+      updatedAt: stamp,
+    };
+    await db.batches.put(mergedBatch);
+    await db.reviews.put(review);
+    await db.merges.put(merge);
+    return merge;
+  });
+}
+
+/**
+ * 重算合回：按当前来源分支的重量与审评重新加权。
+ * 成功 → 更新合回批次 / 审评与来源快照，状态回到 confirmed；
+ * 失败 → 不改动已落库的批次 / 审评（恢复旧结果），状态置为 stale 并记录错误，允许重试。
+ */
+export async function recomputeMerge(mergeId: string): Promise<MergeRecord> {
+  return db.transaction('rw', [db.merges, db.batches, db.reviews], async () => {
+    const merge = await db.merges.get(mergeId);
+    if (!merge) throw new Error('合回记录不存在');
+    try {
+      const sourceIds = merge.sources.map((source) => source.batchId);
+      const branches = await db.batches.where('id').anyOf(sourceIds).toArray();
+      const branchMap = new Map(branches.map((branch) => [branch.id, branch]));
+      const reviewIds = merge.sources.map((source) => source.reviewId);
+      const reviews = await db.reviews.where('id').anyOf(reviewIds).toArray();
+      const reviewMap = new Map(reviews.map((item) => [item.id, item]));
+      const sources: MergeSource[] = merge.sources.map((old) => {
+        const branch = branchMap.get(old.batchId);
+        if (!branch) throw new Error(`来源分支「${old.batchLabel}」已被删除`);
+        const review = reviewMap.get(old.reviewId);
+        if (!review) throw new Error(`来源分支「${old.batchLabel}」的审评记录已删除`);
+        return {
+          ...old,
+          weightKg: branch.freshLeafKg,
+          reviewId: review.id,
+          totalScore: review.totalScore,
+          aroma: review.aroma,
+          liquorColor: review.liquorColor,
+          taste: review.taste,
+          leafBase: review.leafBase,
+        };
+      });
+      const preview = computeMergePreview(sources);
+      const mergedBatch = await db.batches.get(merge.mergedBatchId);
+      if (!mergedBatch) throw new Error('合回批次已被删除');
+      const review = await db.reviews.get(merge.reviewId);
+      if (!review) throw new Error('合回审评记录已删除');
+      const stamp = nowIso();
+      await db.batches.put({ ...mergedBatch, freshLeafKg: preview.totalWeightKg, updatedAt: stamp });
+      await db.reviews.put({
+        ...review,
+        aroma: preview.aroma,
+        liquorColor: preview.liquorColor,
+        taste: preview.taste,
+        leafBase: preview.leafBase,
+        totalScore: preview.resultScore,
+        updatedAt: stamp,
+      });
+      const updated: MergeRecord = {
+        ...merge,
+        sources,
+        totalWeightKg: preview.totalWeightKg,
+        resultScore: preview.resultScore,
+        status: 'confirmed',
+        lastError: '',
+        updatedAt: stamp,
+      };
+      await db.merges.put(updated);
+      return updated;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '重算失败';
+      const restored: MergeRecord = {
+        ...merge,
+        status: 'stale',
+        lastError: message,
+        updatedAt: nowIso(),
+      };
+      await db.merges.put(restored);
+      throw new Error(message);
+    }
+  });
+}
+
 /* ---------------------------- 整库导入导出 ---------------------------- */
 
 /** 整库快照（导出 / 导入 JSON 的结构） */
@@ -635,24 +939,37 @@ export interface DatabaseSnapshot {
   fixes: Fix[];
   roasts: Roast[];
   reviews: Review[];
+  merges: MergeRecord[];
 }
 
 /** 导出整库快照 */
 export async function exportSnapshot(): Promise<DatabaseSnapshot> {
-  const [gardens, batches, turns, fixes, roasts, reviews] = await Promise.all([
+  const [gardens, batches, turns, fixes, roasts, reviews, merges] = await Promise.all([
     db.gardens.toArray(),
     db.batches.toArray(),
     db.turns.toArray(),
     db.fixes.toArray(),
     db.roasts.toArray(),
     db.reviews.toArray(),
+    db.merges.toArray(),
   ]);
-  return { name: DB_NAME, schemaVersion: DB_VERSION, exportedAt: nowIso(), gardens, batches, turns, fixes, roasts, reviews };
+  return {
+    name: DB_NAME,
+    schemaVersion: DB_VERSION,
+    exportedAt: nowIso(),
+    gardens,
+    batches,
+    turns,
+    fixes,
+    roasts,
+    reviews,
+    merges,
+  };
 }
 
 /** 用快照覆盖整库（导入存档） */
 export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> {
-  await db.transaction('rw', [db.gardens, db.batches, db.turns, db.fixes, db.roasts, db.reviews], async () => {
+  await db.transaction('rw', [db.gardens, db.batches, db.turns, db.fixes, db.roasts, db.reviews, db.merges], async () => {
     await Promise.all([
       db.gardens.clear(),
       db.batches.clear(),
@@ -660,6 +977,7 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
       db.fixes.clear(),
       db.roasts.clear(),
       db.reviews.clear(),
+      db.merges.clear(),
     ]);
     await db.gardens.bulkPut(snapshot.gardens);
     await db.batches.bulkPut(snapshot.batches);
@@ -667,12 +985,13 @@ export async function importSnapshot(snapshot: DatabaseSnapshot): Promise<void> 
     await db.fixes.bulkPut(snapshot.fixes);
     await db.roasts.bulkPut(snapshot.roasts);
     await db.reviews.bulkPut(snapshot.reviews);
+    await db.merges.bulkPut(snapshot.merges ?? []);
   });
 }
 
 /** 清空全部表（不重新播种） */
 export async function clearAllTables(): Promise<void> {
-  await db.transaction('rw', [db.gardens, db.batches, db.turns, db.fixes, db.roasts, db.reviews], async () => {
+  await db.transaction('rw', [db.gardens, db.batches, db.turns, db.fixes, db.roasts, db.reviews, db.merges], async () => {
     await Promise.all([
       db.gardens.clear(),
       db.batches.clear(),
@@ -680,6 +999,7 @@ export async function clearAllTables(): Promise<void> {
       db.fixes.clear(),
       db.roasts.clear(),
       db.reviews.clear(),
+      db.merges.clear(),
     ]);
   });
 }
@@ -692,13 +1012,14 @@ export async function resetDatabase(): Promise<void> {
 
 /** 各表行数概览（页脚与统计徽标使用） */
 export async function countAll(): Promise<Record<string, number>> {
-  const [gardens, batches, turns, fixes, roasts, reviews] = await Promise.all([
+  const [gardens, batches, turns, fixes, roasts, reviews, merges] = await Promise.all([
     db.gardens.count(),
     db.batches.count(),
     db.turns.count(),
     db.fixes.count(),
     db.roasts.count(),
     db.reviews.count(),
+    db.merges.count(),
   ]);
-  return { gardens, batches, turns, fixes, roasts, reviews };
+  return { gardens, batches, turns, fixes, roasts, reviews, merges };
 }

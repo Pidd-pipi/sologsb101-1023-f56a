@@ -5,6 +5,7 @@
  */
 import { ALTITUDE_BANDS, type Cultivar, type Garden, type Soil } from '../types/garden';
 import type { Batch, BatchState, Tenderness } from '../types/batch';
+import type { MergePreview, MergeRecord, MergeSource } from '../types/merge';
 import { TURN_LIMITS, type Turn } from '../types/turn';
 import type { FixLevel, RollPressure } from '../types/fix';
 import {
@@ -358,12 +359,17 @@ export function matchScoreBand(score: number, bandKeys: string[]): boolean {
 
 /* ----------------------------- 拼配候选 ----------------------------- */
 
-/** 按总分由高到低生成拼配候选清单 */
-export function buildBlendCandidates(reviews: Review[], batches: Batch[], gardens: Garden[]): BlendCandidate[] {
+/** 按总分由高到低生成拼配候选清单；excludeReviewIds 中的审评（失效合回）撤下 */
+export function buildBlendCandidates(
+  reviews: Review[],
+  batches: Batch[],
+  gardens: Garden[],
+  excludeReviewIds: ReadonlySet<string> = new Set(),
+): BlendCandidate[] {
   const batchMap = new Map(batches.map((batch) => [batch.id, batch]));
   const gardenMap = new Map(gardens.map((garden) => [garden.id, garden]));
   return reviews
-    .filter((review) => batchMap.has(review.batchId))
+    .filter((review) => batchMap.has(review.batchId) && !excludeReviewIds.has(review.id))
     .map((review) => {
       const batch = batchMap.get(review.batchId) as Batch;
       const garden = gardenMap.get(batch.gardenId);
@@ -408,4 +414,98 @@ export function finalWaterLoss(turns: Turn[]): number {
   if (turns.length === 0) return 0;
   const ordered = [...turns].sort((a, b) => a.roundNo - b.roundNo);
   return ordered[ordered.length - 1].waterLossPct;
+}
+
+/* ----------------------------- 拆批与合回 ----------------------------- */
+
+/** 拆批表单的一行分支重量输入 */
+export interface SplitRowInput {
+  key: string;
+  kg: number;
+}
+
+/** 批次原始重量（被拆过取 originalFreshLeafKg，否则取 freshLeafKg） */
+export function originalLotKg(parent: Batch): number {
+  return roundTo(parent.originalFreshLeafKg ?? parent.freshLeafKg, 2);
+}
+
+/** 当前可拆余量（父批次 freshLeafKg 即余量） */
+export function currentRemainingKg(parent: Batch): number {
+  return roundTo(parent.freshLeafKg, 2);
+}
+
+/** 已拆出的分支合计重量 */
+export function splitOffKg(parent: Batch, branches: Batch[]): number {
+  const sum = branches
+    .filter((branch) => branch.parentBatchId === parent.id)
+    .reduce((acc, branch) => acc + (Number.isFinite(branch.freshLeafKg) ? branch.freshLeafKg : 0), 0);
+  return roundTo(sum, 2);
+}
+
+/**
+ * 校验拆批草稿：每支重量 > 0，且分支合计不超过当前余量。
+ * 返回中文错误说明；合法返回 null。
+ */
+export function validateSplitRows(remainingKg: number, rows: SplitRowInput[]): string | null {
+  if (rows.length === 0) return '请至少填写一支分支重量';
+  for (const row of rows) {
+    if (!Number.isFinite(row.kg) || row.kg <= 0) return '每支重量必须大于 0 kg';
+  }
+  const sum = rows.reduce((acc, row) => acc + row.kg, 0);
+  if (sum > remainingKg + 1e-6) {
+    return `本批合计 ${roundTo(sum, 1)}kg 超过当前余量 ${roundTo(remainingKg, 1)}kg，请调小分支重量或减少支数`;
+  }
+  return null;
+}
+
+/** 合回兼容性键：同山场（品种随山场）+ 同工序 */
+export function mergeCompatibilityKey(gardenId: string, state: string): string {
+  return `${gardenId}__${state}`;
+}
+
+/** 由来源分支计算合回预览：重量相加，审评分按毛茶重量加权 */
+export function computeMergePreview(sources: MergeSource[]): MergePreview {
+  const totalWeightKg = roundTo(
+    sources.reduce((acc, source) => acc + (Number.isFinite(source.weightKg) ? source.weightKg : 0), 0),
+    2,
+  );
+  if (totalWeightKg <= 0) throw new Error('合回总重量必须大于 0 kg');
+  const weighted = (key: 'aroma' | 'liquorColor' | 'taste' | 'leafBase'): number =>
+    roundTo(
+      sources.reduce(
+        (acc, source) => acc + (Number.isFinite(source[key]) ? source[key] : 0) * source.weightKg,
+        0,
+      ) / totalWeightKg,
+      1,
+    );
+  const aroma = weighted('aroma');
+  const liquorColor = weighted('liquorColor');
+  const taste = weighted('taste');
+  const leafBase = weighted('leafBase');
+  const resultScore = weightedTotalScore({ aroma, liquorColor, taste, leafBase });
+  return { sources, totalWeightKg, resultScore, aroma, liquorColor, taste, leafBase };
+}
+
+/** 当前来源快照（用于失效判定） */
+export interface MergeSourceSnapshot {
+  batchId: string;
+  weightKg: number;
+  reviewId: string;
+  totalScore: number;
+}
+
+/**
+ * 判定合回是否已失效：来源分支数量变化、重量变化、审评变化（id 或总分）即失效。
+ */
+export function isMergeStale(merge: MergeRecord, current: MergeSourceSnapshot[]): boolean {
+  if (current.length !== merge.sources.length) return true;
+  const currentMap = new Map(current.map((item) => [item.batchId, item]));
+  for (const source of merge.sources) {
+    const item = currentMap.get(source.batchId);
+    if (!item) return true;
+    if (item.reviewId !== source.reviewId) return true;
+    if (Math.abs(item.weightKg - source.weightKg) > 1e-6) return true;
+    if (Math.abs(item.totalScore - source.totalScore) > 0.05) return true;
+  }
+  return false;
 }

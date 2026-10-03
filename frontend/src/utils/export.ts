@@ -155,6 +155,9 @@ export function parseSnapshotJson(text: string): DatabaseSnapshot {
   assertRows(raw.fixes, 'fixes');
   assertRows(raw.roasts, 'roasts');
   assertRows(raw.reviews, 'reviews');
+  // 旧存档没有 merges 表时按空数组兼容（旧数据按单支批次导入）
+  const merges = Array.isArray(raw.merges) ? raw.merges : [];
+  assertRows(merges, 'merges');
   return {
     name: DB_NAME,
     schemaVersion: typeof raw.schemaVersion === 'number' ? raw.schemaVersion : DB_VERSION,
@@ -165,6 +168,7 @@ export function parseSnapshotJson(text: string): DatabaseSnapshot {
     fixes: raw.fixes as DatabaseSnapshot['fixes'],
     roasts: raw.roasts as DatabaseSnapshot['roasts'],
     reviews: raw.reviews as DatabaseSnapshot['reviews'],
+    merges: merges as DatabaseSnapshot['merges'],
   };
 }
 

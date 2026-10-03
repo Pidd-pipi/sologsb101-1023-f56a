@@ -15,6 +15,7 @@ import EmptyPanel from '../components/common/EmptyPanel';
 import { useIdbTable } from '../hooks/useIdbTable';
 import { useGardenStore } from '../stores/gardenStore';
 import { filterBlendCandidates, useBatchStore } from '../stores/batchStore';
+import { useMergeStore } from '../stores/mergeStore';
 import { db, exportSnapshot } from '../utils/db';
 import {
   blendNoteOf,
@@ -49,11 +50,12 @@ export default function BlendPlan() {
     prefix: 'review',
     sort: (a, b) => b.totalScore - a.totalScore,
   });
+  const staleReviewIds = useMergeStore((state) => state.staleReviewIds);
   const [saving, setSaving] = useState(false);
 
   const candidates = useMemo(
-    () => buildBlendCandidates(reviewsTable.rows, batches, gardens),
-    [batches, gardens, reviewsTable.rows],
+    () => buildBlendCandidates(reviewsTable.rows, batches, gardens, new Set(staleReviewIds)),
+    [batches, gardens, reviewsTable.rows, staleReviewIds],
   );
   const rows = useMemo(() => filterBlendCandidates(candidates, blendFilters), [blendFilters, candidates]);
 

@@ -43,6 +43,7 @@ docker compose up -d --build
 | `/roasting` | 焙火曲线与复焙安排 | 多道次按序排列（上移 / 下移写回 `passNo`）、足火判定（轻火 / 中火 / 足火）、复焙提醒（逾期 / 今日 / 7 日内 / 已排期） |
 | `/reviews` | 毛茶审评 | 香气 30% / 汤色 20% / 滋味 35% / 叶底 15% 加权换算总分，按总分排序并生成拼配候选清单 |
 | `/blending` | 拼配方案登记与结构版本导出 | 按总分组合批次与占比、**占比校验（合计必须 100%）**、方案 JSON 与整库结构版本 JSON 导出 |
+| `/split-merge` | 拆并工作台 | 杀青后分路焙火：拆批写清各支公斤与余量（合计对上原批次），各支继承拆分前做青 / 杀青工艺作只读底稿；挑路合回只接同山场、品种、工序的分支，重量相加、审评分按毛茶重量加权，来源一变立即失效重算并从拼配候选撤下 |
 
 批次工序状态按工序自动流转：**做青中 → 已杀青 → 已焙火 → 已审评**（只向后推进，不回退）。
 
@@ -97,18 +98,20 @@ sologsb101-1023/
         ├── App.tsx                 # 外壳：侧边导航、当前山场/批次、行数统计、首次初始化 + 播种
         ├── vite-env.d.ts
         ├── styles/main.css         # 墨绿/茶褐/炭金主题与拖拽、时间线样式
-        ├── types/                  # 六个实体各一文件
+        ├── types/                  # 实体各一文件
         │   ├── garden.ts           # 山场：name / altitudeM / soil / cultivar / aspect
-        │   ├── batch.ts            # 茶青批次：gardenId / pickedAt / freshLeafKg / tenderness / weather / state
+        │   ├── batch.ts            # 茶青批次：gardenId / pickedAt / freshLeafKg / tenderness / weather / state，以及拆并字段 parentBatchId / branchNo / mergedFromBatchIds / originalFreshLeafKg
         │   ├── turn.ts             # 做青轮次：batchId / roundNo / shakeMin / restMin / roomTempC / humidityPct / waterLossPct
         │   ├── fix.ts              # 杀青揉捻：batchId / wokTempC / fixMin / rollPressure / rollMin / operator
         │   ├── roast.ts            # 焙火：batchId / passNo / tempC / hours / charcoal / nextRoastDate / state
-        │   └── review.ts           # 审评：batchId / reviewedAt / aroma / liquorColor / taste / leafBase / totalScore / blendNote
+        │   ├── review.ts           # 审评：batchId / reviewedAt / aroma / liquorColor / taste / leafBase / totalScore / blendNote
+        │   └── merge.ts            # 合回：mergedBatchId / reviewId / gardenId / state / sources（来源快照）/ resultScore / status（confirmed | stale）
         ├── stores/                 # Zustand：跨页状态全部放这里
         │   ├── gardenStore.ts      # 山场列表、派生指标、当前选中山场、筛选条件
         │   ├── batchStore.ts       # 批次与工序流转、杀青/审评/拼配筛选、拼配方案草稿
         │   ├── turnStore.ts        # 当前批次轮次、参数模板、拖拽重排（写回 roundNo）
-        │   └── roastStore.ts       # 焙火道次顺序、复焙提醒、足火判定
+        │   ├── roastStore.ts       # 焙火道次顺序、复焙提醒、足火判定
+        │   └── mergeStore.ts       # 拆批 / 合回、来源失效判定（staleReviewIds 从拼配候选撤下）、重算与失败恢复
         ├── components/common/      # 共享组件
         │   ├── GradeTag.tsx        # 嫩度 / 火功 / 评分 / 工序状态 / 焙火状态 / 揉捻压力标签
         │   ├── FilterBar.tsx       # 关键字 + 多个下拉多选，并同步 URL query
@@ -121,13 +124,14 @@ sologsb101-1023/
         │   ├── tea.ts              # 嫩度/火功枚举映射、温湿度与失水率区间判定、评分加权换算、拼配候选
         │   ├── db.ts               # Dexie 实例、六张表、version(1) + version(2) 迁移、播种、快照导入导出
         │   └── export.ts           # 批次工艺记录 / 整库存档 / 拼配方案 JSON 导出与校验
-        ├── pages/                  # 六个页面，与路由一一对应
+        ├── pages/                  # 七个页面，与路由一一对应
         │   ├── GardenList.tsx      # /gardens
         │   ├── TurnBoard.tsx       # /turns
         │   ├── FixRecord.tsx       # /fixing
         │   ├── RoastPlan.tsx       # /roasting
         │   ├── ReviewBoard.tsx     # /reviews
-        │   └── BlendPlan.tsx       # /blending
+        │   ├── BlendPlan.tsx       # /blending
+        │   └── SplitMerge.tsx      # /split-merge 拆批（各支公斤 + 余量，继承只读底稿）与合回（同山场 / 品种 / 工序，重量相加、评分加权，失效重算）
         └── router/index.tsx        # 路由表：/ 与未知路径重定向到 /gardens，页面懒加载
 ```
 
@@ -136,10 +140,11 @@ sologsb101-1023/
 ## 六、IndexedDB 库名与数据存储说明
 
 - **库名**：`gbtearock`（`src/utils/db.ts` 中的 `DB_NAME`）
-- **结构版本号**：`DB_VERSION = 2`
+- **结构版本号**：`DB_VERSION = 3`
   - `version(1)` 初版结构：六张分表的最小索引
   - `version(2).stores(...)` 补齐外键 / 状态 / 日期索引，并 `.upgrade()` **真实迁移历史数据**：补齐 `createdAt` / `updatedAt`、山场补齐朝向与土壤品种兜底值、批次工序状态归一化、轮次与焙火数值截断到合法区间、审评总分由「四项简单平均」改为「分项加权换算」后重算。
-- **分表**：`gardens`、`batches`、`turns`、`fixes`、`roasts`、`reviews`（每条记录都有 `id` / `createdAt` / `updatedAt`）
+  - `version(3).stores(...)` 新增合回记录表 `merges`，批次补 `parentBatchId` / `branchNo` / `mergedFromBatchIds` / `originalFreshLeafKg` 字段；`.upgrade()` 把旧批次的拆分 / 合回字段补默认值（`parentBatchId = null`），**旧数据按单支批次兼容**。
+- **分表**：`gardens`、`batches`、`turns`、`fixes`、`roasts`、`reviews`、`merges`（每条记录都有 `id` / `createdAt` / `updatedAt`）
 - **首屏自动播种**：`initDatabase()` 中 `if ((await db.gardens.count()) === 0) { await seedDatabase() }`，播种 3 层互相引用的演示数据 —— 3 个山场 → 4 个茶青批次 → 每个批次下 2-3 条做青轮次、1 条杀青揉捻、1-2 道焙火、1 条审评，父→子→孙贯通；播种使用固定 id + `bulkPut`，**幂等**，重复执行不会产生重复行。
 - **级联删除**：删除山场会级联删除其批次与批次下的轮次 / 杀青 / 焙火 / 审评；删除批次会级联删除其全部工序子表（均使用 `db.transaction`）。
 - **导出 / 导入**：山场页支持「导出整库 JSON / 导入 JSON」（Blob + `URL.createObjectURL` + `a.download`，导入前做结构与库名校验，校验失败弹错误提示）；拼配页支持拼配方案 JSON 与整库结构版本 JSON 导出。
